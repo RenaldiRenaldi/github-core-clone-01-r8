@@ -4,7 +4,7 @@ import {existsSync} from 'node:fs';
 
 const binary=fileURLToPath(new URL('./forge',import.meta.url));
 if(!existsSync(binary)){
-  const build=spawn(process.env.GO_BIN??`${process.env.HOME}/bin/go/bin/go`,['build','-o',binary,'.'],{stdio:'inherit',env:process.env});
+  const build=spawn(process.env.GO_BIN??`${process.env.HOME??'/home/hatch'}/bin/go/bin/go`,['build','-o',binary,'.'],{stdio:'inherit',env:process.env});
   build.once('error',error=>{console.error(error.message);process.exitCode=1});
   build.once('exit',(code,signal)=>{
     if(signal||code!==0){process.exitCode=code??1;return}
