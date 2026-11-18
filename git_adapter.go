@@ -9,6 +9,17 @@ import (
 // selected repository's object and ref maps, then publishes accepted pushes
 // back into the shared REST/GraphQL store.
 func serveGitAdapter(w http.ResponseWriter, r *http.Request, repo *Repo) {
+	prefix := "/" + repo.Owner + "/" + repo.Name + ".git"
+	if len(repo.Refs) == 0 {
+		if !strings.HasPrefix(r.URL.Path, prefix+"/") {
+			http.NotFound(w, r)
+			return
+		}
+		suffix := strings.TrimPrefix(r.URL.Path, prefix+"/")
+		gitHTTP(w, r, repo, strings.Split(suffix, "/"))
+		return
+	}
+
 	core := &r8Forge{
 		objects: make(map[string]r8Object, len(repo.Objects)),
 		refs:    make(map[string]string, len(repo.Refs)),
@@ -21,14 +32,15 @@ func serveGitAdapter(w http.ResponseWriter, r *http.Request, repo *Repo) {
 		core.refs[ref] = id
 	}
 
-	originalPath := r.URL.Path
-	prefix := "/" + repo.Owner + "/" + repo.Name + ".git"
-	if !strings.HasPrefix(originalPath, prefix+"/") {
+	if !strings.HasPrefix(r.URL.Path, prefix+"/") {
 		http.NotFound(w, r)
 		return
 	}
 	core.ServeHTTP(w, r)
 
+	if !strings.HasSuffix(r.URL.Path, "/git-receive-pack") {
+		return
+	}
 	for ref := range repo.Refs {
 		delete(repo.Refs, ref)
 	}
