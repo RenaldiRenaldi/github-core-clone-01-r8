@@ -1,3 +1,3 @@
-module github-core-clone-01-r8
+module forge
 
 go 1.24
