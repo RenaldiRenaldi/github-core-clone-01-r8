@@ -10,60 +10,69 @@ import (
 
 // Small recursive selection parser: aliases, variables, nested inputs and projection.
 type field struct {
-	name, alias string
-	args        M
-	children    []field
+	name     string
+	alias    string
+	args     M
+	children []field
 }
 type parser struct {
 	tokens []string
 	i      int
 	vars   M
+	depth  int
 }
 
-func lex(s string) []string {
-	out := []string{}
-	for i := 0; i < len(s); {
-		c := s[i]
-		if unicode.IsSpace(rune(c)) || c == ',' {
-			i++
+func lex(query string) []string {
+	var tokens []string
+	for cursor := 0; cursor < len(query); {
+		begin := cursor
+		switch current := query[cursor]; {
+		case current == ',' || unicode.IsSpace(rune(current)):
+			cursor++
 			continue
-		}
-		if c == '#' {
-			for i < len(s) && s[i] != '\n' {
-				i++
+		case current == '#':
+			newline := strings.IndexAny(query[cursor:], "\r\n")
+			if newline < 0 {
+				return tokens
 			}
+			cursor += newline
 			continue
-		}
-		if c == '"' {
-			j := i + 1
-			for j < len(s) {
-				if s[j] == '\\' {
-					j += 2
-					continue
-				}
-				if s[j] == '"' {
-					j++
-					break
-				}
-				j++
+		case current == '"':
+			cursor = quotedEnd(query, cursor)
+		case strings.HasPrefix(query[cursor:], "..."):
+			cursor += 3
+		case nameByte(current):
+			for cursor++; cursor < len(query) && nameByte(query[cursor]); cursor++ {
 			}
-			out = append(out, s[i:j])
-			i = j
-			continue
+		default:
+			cursor++
 		}
-		if strings.ContainsRune("{}():![]$=", rune(c)) {
-			out = append(out, string(c))
-			i++
-			continue
-		}
-		j := i + 1
-		for j < len(s) && (unicode.IsLetter(rune(s[j])) || unicode.IsDigit(rune(s[j])) || s[j] == '_' || s[j] == '-' || s[j] == '.') {
-			j++
-		}
-		out = append(out, s[i:j])
-		i = j
+		tokens = append(tokens, query[begin:cursor])
 	}
-	return out
+	return tokens
+}
+
+func nameByte(c byte) bool {
+	return c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' ||
+		c >= '0' && c <= '9' || c == '_' || c == '-'
+}
+
+func quotedEnd(query string, open int) int {
+	escaped := false
+	for end := open + 1; end < len(query); end++ {
+		if escaped {
+			escaped = false
+			continue
+		}
+		switch query[end] {
+		case '\\':
+			escaped = true
+		case '"':
+			return end + 1
+		}
+	}
+	fail(400, "Unterminated GraphQL string")
+	return len(query)
 }
 func (p *parser) peek() string {
 	if p.i >= len(p.tokens) {
@@ -71,8 +80,37 @@ func (p *parser) peek() string {
 	}
 	return p.tokens[p.i]
 }
-func (p *parser) take() string { s := p.peek(); p.i++; return s }
+func (p *parser) take() string {
+	token := p.peek()
+	if token != "" {
+		p.i++
+	}
+	return token
+}
+
+func (p *parser) accept(want string) bool {
+	if p.peek() != want {
+		return false
+	}
+	p.i++
+	return true
+}
+
+func (p *parser) require(want string) {
+	if !p.accept(want) {
+		fail(400, "Expected GraphQL token "+want)
+	}
+}
+
+func (p *parser) enter() {
+	p.depth++
+	if p.depth > 64 {
+		fail(400, "GraphQL nesting limit exceeded")
+	}
+}
 func (p *parser) value() any {
+	p.enter()
+	defer func() { p.depth-- }()
 	t := p.take()
 	if t == "$" {
 		return p.vars[p.take()]
@@ -81,10 +119,10 @@ func (p *parser) value() any {
 		v := M{}
 		for p.peek() != "}" && p.peek() != "" {
 			k := p.take()
-			p.take()
+			p.require(":")
 			v[k] = p.value()
 		}
-		p.take()
+		p.require("}")
 		return v
 	}
 	if t == "[" {
@@ -92,7 +130,7 @@ func (p *parser) value() any {
 		for p.peek() != "]" && p.peek() != "" {
 			v = append(v, p.value())
 		}
-		p.take()
+		p.require("]")
 		return v
 	}
 	if strings.HasPrefix(t, "\"") {
@@ -105,48 +143,53 @@ func (p *parser) value() any {
 	if t == "false" {
 		return false
 	}
+	if t == "null" {
+		return nil
+	}
 	if n, e := strconv.Atoi(t); e == nil {
 		return n
 	}
 	return t
 }
 func (p *parser) selection() []field {
-	p.take()
-	out := []field{}
-	for p.peek() != "}" && p.peek() != "" {
-		if p.peek() == "..." {
-			p.take()
-			if p.peek() == "on" {
-				p.take()
+	p.enter()
+	defer func() { p.depth-- }()
+	p.require("{")
+	var fields []field
+	for !p.accept("}") {
+		if p.peek() == "" {
+			fail(400, "Unterminated GraphQL selection")
+		}
+		if p.accept("...") {
+			if p.accept("on") {
 				p.take()
 			}
 			if p.peek() == "{" {
-				out = append(out, p.selection()...)
+				fields = append(fields, p.selection()...)
+			} else {
+				p.take()
 			}
 			continue
 		}
-		f := field{name: p.take(), args: M{}}
-		f.alias = f.name
-		if p.peek() == ":" {
-			p.take()
-			f.name = p.take()
+		key := p.take()
+		selected := field{name: key, alias: key}
+		if p.accept(":") {
+			selected.name = p.take()
 		}
-		if p.peek() == "(" {
-			p.take()
-			for p.peek() != ")" && p.peek() != "" {
-				k := p.take()
-				p.take()
-				f.args[k] = p.value()
+		if p.accept("(") {
+			selected.args = M{}
+			for !p.accept(")") {
+				arg := p.take()
+				p.require(":")
+				selected.args[arg] = p.value()
 			}
-			p.take()
 		}
 		if p.peek() == "{" {
-			f.children = p.selection()
+			selected.children = p.selection()
 		}
-		out = append(out, f)
+		fields = append(fields, selected)
 	}
-	p.take()
-	return out
+	return fields
 }
 func project(v any, fs []field) any {
 	if len(fs) == 0 {

@@ -41,9 +41,14 @@ git -C demo-full config user.email tester@example.test
 printf 'push test\\n' > demo-full/push-test.txt
 git -C demo-full add push-test.txt
 git -C demo-full commit -m 'Test receive-pack'
-git -C demo-full push http://127.0.0.1:8080/adaiversen/demo.git HEAD:refs/heads/test
+git -C demo-full -c 'http.extraHeader=Authorization: Bearer forge-demo' \
+  push origin HEAD:refs/heads/test
 ```
 
 The REST API is rooted at `/api/v3`, GraphQL at `/api/graphql`, and MCP JSON-RPC
 at `/mcp`. `/healthz` returns a small health response. API and push requests use
 the `forge-demo` token by default; set `MAKEFUN_SHOP_TOKEN` to change it.
+
+Repository state lasts for the life of the server. A restart clears objects,
+refs, and collaboration data. Run the examples against a local instance;
+the built-in demo token is public.

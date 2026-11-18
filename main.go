@@ -3,15 +3,19 @@ package main
 import (
 	"bytes"
 	"compress/gzip"
+	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -106,19 +110,11 @@ func (s *Store) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		j(w, M{"ok": true})
 		return
 	}
-	auth := r.Header.Get("Authorization")
-	token := os.Getenv("MAKEFUN_SHOP_TOKEN")
-	if token == "" {
-		token = "forge-demo"
-	}
-	ok := auth == "Bearer "+token || auth == "token "+token
-	if strings.HasPrefix(auth, "Basic ") {
-		_, pass, yes := r.BasicAuth()
-		ok = yes && pass == token
-	}
+	ok := authorized(r)
 	p := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
 	isGit := len(p) >= 3 && strings.HasSuffix(p[1], ".git")
-	if (strings.HasPrefix(r.URL.Path, "/api/") || r.URL.Path == "/mcp" || isGit && strings.Contains(r.URL.String(), "receive-pack")) && !ok {
+	writeGit := isGit && (p[2] == "git-receive-pack" || r.URL.Query().Get("service") == "git-receive-pack")
+	if (strings.HasPrefix(r.URL.Path, "/api/") || r.URL.Path == "/mcp" || writeGit) && !ok {
 		w.Header().Set("WWW-Authenticate", "Basic realm=forge")
 		fail(401, "Bad credentials")
 	}
@@ -135,10 +131,11 @@ func (s *Store) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if strings.HasPrefix(r.URL.Path, "/api/") || r.URL.Path == "/mcp" {
 		in := M{}
 		if r.Body != nil && r.Method != "GET" {
-			b, err := io.ReadAll(io.LimitReader(r.Body, 64<<20))
+			b, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 64<<20))
 			if err != nil {
 				fail(400, "Read error")
 			}
+			b = bytes.TrimSpace(b)
 			if r.URL.Path == "/api/graphql" && len(b) > 0 && b[0] == '[' {
 				var batch []M
 				if json.Unmarshal(b, &batch) != nil {
@@ -172,52 +169,129 @@ func (s *Store) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	s.ui(w, r, p)
 }
+func authorized(request *http.Request) bool {
+	want := os.Getenv("MAKEFUN_SHOP_TOKEN")
+	if want == "" {
+		want = "forge-demo"
+	}
+	var credential string
+	if _, password, basic := request.BasicAuth(); basic {
+		credential = password
+	} else {
+		scheme, value, present := strings.Cut(request.Header.Get("Authorization"), " ")
+		if !present || !(strings.EqualFold(scheme, "bearer") || strings.EqualFold(scheme, "token")) {
+			return false
+		}
+		credential = value
+	}
+	return subtle.ConstantTimeCompare([]byte(credential), []byte(want)) == 1
+}
+
 func main() {
-	if dir := os.Getenv("MAKEFUN_OUTPUT_DIR"); dir != "" && os.Getenv("MAKEFUN_ENV_URL") == "" {
-		writeProof(dir)
-		return
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if err := runForge(ctx); err != nil {
+		fmt.Fprintln(os.Stderr, "forge:", err)
+		os.Exit(1)
 	}
-	s := NewStore()
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = "0"
+}
+
+func runForge(ctx context.Context) error {
+	controller := strings.TrimRight(os.Getenv("MAKEFUN_ENV_URL"), "/")
+	if output := os.Getenv("MAKEFUN_OUTPUT_DIR"); output != "" && controller == "" {
+		writeProof(output)
+		return nil
 	}
-	ln, err := net.Listen("tcp", ":"+port)
-	if err != nil {
-		panic(err)
+	listenPort := os.Getenv("PORT")
+	if listenPort == "" {
+		listenPort = "0"
 	}
-	srv := &http.Server{Handler: s, ReadHeaderTimeout: 10 * time.Second}
-	go srv.Serve(ln)
-	fmt.Println("forge listening", ln.Addr())
-	env := strings.TrimRight(os.Getenv("MAKEFUN_ENV_URL"), "/")
-	if env == "" {
-		select {}
+	listener, listenErr := net.Listen("tcp", net.JoinHostPort("", listenPort))
+	if listenErr != nil {
+		return fmt.Errorf("listen on port %s: %w", listenPort, listenErr)
 	}
+	actual := listener.Addr().(*net.TCPAddr).Port
+	service := &http.Server{
+		Handler:           NewStore(),
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
+	defer service.Close()
+	stopped := make(chan error, 1)
+	go func() { stopped <- service.Serve(listener) }()
+	fmt.Printf("forge listening on port %d\n", actual)
+
+	if controller != "" {
+		go func() {
+			followController(ctx, controller, actual)
+			stopped <- nil
+		}()
+	}
+	select {
+	case serveErr := <-stopped:
+		return serveErr
+	case <-ctx.Done():
+		shutdown, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		return service.Shutdown(shutdown)
+	}
+}
+
+func followController(ctx context.Context, base string, port int) {
 	client := &http.Client{Timeout: 30 * time.Second}
-	data, _ := json.Marshal(M{"port": ln.Addr().(*net.TCPAddr).Port})
+	defer client.CloseIdleConnections()
+	address := []byte(fmt.Sprintf("{\"port\":%d}", port))
+	poll := time.NewTicker(250 * time.Millisecond)
+	defer poll.Stop()
+	registered := false
 	for {
-		resp, e := client.Post(env+"/register", "application/json", bytes.NewReader(data))
-		if e == nil {
-			resp.Body.Close()
-			if resp.StatusCode == 200 || resp.StatusCode == 409 {
-				break
+		if registered {
+			if controllerDone(ctx, client, base) {
+				return
+			}
+		} else {
+			registered = registerServer(ctx, client, base, address)
+			if registered {
+				continue
 			}
 		}
-		time.Sleep(250 * time.Millisecond)
-	}
-	for {
-		resp, e := client.Get(env + "/done")
-		if e == nil {
-			var v M
-			json.NewDecoder(resp.Body).Decode(&v)
-			resp.Body.Close()
-			if v["done"] == true {
-				break
-			}
+		select {
+		case <-ctx.Done():
+			return
+		case <-poll.C:
 		}
-		time.Sleep(250 * time.Millisecond)
 	}
-	srv.Close()
+}
+
+func registerServer(ctx context.Context, client *http.Client, base string, body []byte) bool {
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, base+"/register", bytes.NewReader(body))
+	if err != nil {
+		return false
+	}
+	request.Header.Set("Content-Type", "application/json")
+	reply, err := client.Do(request)
+	if err != nil {
+		return false
+	}
+	defer reply.Body.Close()
+	io.Copy(io.Discard, io.LimitReader(reply.Body, 4096))
+	return reply.StatusCode == http.StatusOK || reply.StatusCode == http.StatusConflict
+}
+
+func controllerDone(ctx context.Context, client *http.Client, base string) bool {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+"/done", nil)
+	if err != nil {
+		return false
+	}
+	res, err := client.Do(req)
+	if err != nil {
+		return false
+	}
+	defer res.Body.Close()
+	var progress struct {
+		Done bool `json:"done"`
+	}
+	return json.NewDecoder(io.LimitReader(res.Body, 4096)).Decode(&progress) == nil && progress.Done
 }
 
 // The offline artifact executes the same object/merge engine used by HTTP.

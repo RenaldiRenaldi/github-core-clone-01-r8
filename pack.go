@@ -141,14 +141,5 @@ func parsePackReader(input io.Reader, existing map[string]Object) map[string]Obj
 	if err != nil || len(raw) > 64<<20 {
 		fail(400, "Pack too large")
 	}
-	prior := make(map[string]r8Object, len(existing))
-	for id, obj := range existing {
-		prior[id] = r8Object{kind: obj.Type, data: obj.Data}
-	}
-	decoded := r8InflatePack(raw, prior)
-	out := make(map[string]Object, len(decoded))
-	for id, obj := range decoded {
-		out[id] = Object{Type: obj.kind, Data: obj.data}
-	}
-	return out
+	return r8InflatePack(raw, existing)
 }

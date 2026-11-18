@@ -39,10 +39,6 @@ func gitHTTP(w http.ResponseWriter, q *http.Request, r *Repo, p []string) {
 		fail(400, "Read error")
 	}
 	w.Header().Set("content-type", "application/x-"+service+"-result")
-	if service == "git-receive-pack" {
-		w.Write(receive(r, raw))
-		return
-	}
 	key := fmt.Sprintf("%v:%x", v2, sha256.Sum256(raw))
 	if b := r.Cache[key]; b != nil {
 		w.Write(b)
@@ -367,13 +363,14 @@ func receiveReader(r *Repo, input io.Reader) []byte {
 			staged = parsePackReader(reader, r.Objects)
 		}
 	}()
-	ob := map[string]Object{}
-	for k, v := range r.Objects {
-		ob[k] = v
+	lookup := func(id string) (Object, bool) {
+		if fresh, found := staged[id]; found {
+			return fresh, true
+		}
+		stored, found := r.Objects[id]
+		return stored, found
 	}
-	for k, v := range staged {
-		ob[k] = v
-	}
+	checked := make(map[string]bool, len(staged))
 	type cmd struct{ old, next, ref, err string }
 	commands := []cmd{}
 	counts := map[string]int{}
@@ -414,12 +411,13 @@ func receiveReader(r *Repo, input io.Reader) []byte {
 						c.err = "missing object"
 					}
 				}()
-				closure(ob, []string{c.next})
+				checkIncomingGraph(c.next, lookup, checked)
 			}()
 			if c.err == "" && strings.HasPrefix(c.ref, "refs/heads/") {
-				if ob[c.next].Type != "commit" {
+				target, _ := lookup(c.next)
+				if target.Type != "commit" {
 					c.err = "branch target must be commit"
-				} else if c.old != zero && !ancestor(ob, c.old, c.next) {
+				} else if c.old != zero && !incomingDescendsFrom(c.next, c.old, lookup) {
 					c.err = "non-fast-forward"
 				}
 			}
@@ -482,4 +480,53 @@ func receiveReader(r *Repo, input io.Reader) []byte {
 		return append(sideband(report.Bytes()), []byte("0000")...)
 	}
 	return report.Bytes()
+}
+
+type objectLookup func(string) (Object, bool)
+
+// Validate the closure against the staged objects and the existing store
+// without copying the entire repository on every push.
+func checkIncomingGraph(root string, lookup objectLookup, checked map[string]bool) {
+	pending := []string{root}
+	seen := make(map[string]struct{})
+	for len(pending) != 0 {
+		tail := len(pending) - 1
+		id := pending[tail]
+		pending = pending[:tail]
+		if checked[id] {
+			continue
+		}
+		if _, queued := seen[id]; queued {
+			continue
+		}
+		object, found := lookup(id)
+		if !found {
+			fail(400, "Missing incoming object "+id)
+		}
+		seen[id] = struct{}{}
+		pending = append(pending, links(object)...)
+	}
+	for id := range seen {
+		checked[id] = true
+	}
+}
+
+func incomingDescendsFrom(tip, required string, lookup objectLookup) bool {
+	candidates := []string{tip}
+	reached := map[string]struct{}{}
+	for index := 0; index < len(candidates); index++ {
+		id := candidates[index]
+		if id == required {
+			return true
+		}
+		if _, duplicate := reached[id]; duplicate {
+			continue
+		}
+		reached[id] = struct{}{}
+		if candidate, found := lookup(id); found && candidate.Type == "commit" {
+			_, parents := info(candidate)
+			candidates = append(candidates, parents...)
+		}
+	}
+	return false
 }

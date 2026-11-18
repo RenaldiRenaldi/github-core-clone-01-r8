@@ -6,21 +6,12 @@ import (
 	"crypto/sha1"
 	"encoding/binary"
 	"encoding/hex"
-	"fmt"
 	"io"
+	"sync"
 )
 
-type r8Object struct {
-	kind string
-	data []byte
-}
+var inflaterPool = sync.Pool{}
 
-func r8OID(o r8Object) string {
-	b := []byte(fmt.Sprintf("%s %d\x00", o.kind, len(o.data)))
-	b = append(b, o.data...)
-	h := sha1.Sum(b)
-	return hex.EncodeToString(h[:])
-}
 func r8ReadVarint(b []byte, i *int) int {
 	n, shift := 0, uint(0)
 	for {
@@ -93,7 +84,7 @@ func r8ApplyDelta(base, d []byte) []byte {
 	}
 	return out
 }
-func r8InflatePack(raw []byte, existing map[string]r8Object) map[string]r8Object {
+func r8InflatePack(raw []byte, existing map[string]Object) map[string]Object {
 	if len(raw) < 32 || string(raw[:4]) != "PACK" {
 		panic("missing pack")
 	}
@@ -110,7 +101,7 @@ func r8InflatePack(raw []byte, existing map[string]r8Object) map[string]r8Object
 		baseID         string
 		data           []byte
 	}
-	items := []item{}
+	items := make([]item, 0, min(int(count), 1024))
 	pos := 12
 	for k := uint32(0); k < count; k++ {
 		off := pos
@@ -152,15 +143,7 @@ func r8InflatePack(raw []byte, existing map[string]r8Object) map[string]r8Object
 			panic("object type")
 		}
 		compressed := bytes.NewReader(raw[pos:])
-		z, e := zlib.NewReader(compressed)
-		if e != nil {
-			panic("zlib")
-		}
-		data, e := io.ReadAll(io.LimitReader(z, 64<<20+1))
-		z.Close()
-		if e != nil || len(data) != size {
-			panic("object size")
-		}
+		data := inflateObject(compressed, size)
 		pos = len(raw) - compressed.Len()
 		it.data = data
 		items = append(items, it)
@@ -169,15 +152,15 @@ func r8InflatePack(raw []byte, existing map[string]r8Object) map[string]r8Object
 	if pos+20 != len(raw) || !bytes.Equal(raw[pos:], sum[:]) {
 		panic("pack checksum")
 	}
-	out := map[string]r8Object{}
-	byOff := map[int]r8Object{}
+	out := make(map[string]Object, len(items))
+	byOff := make(map[int]Object, len(items))
 	remaining := items
 	for len(remaining) > 0 {
 		next := []item{}
 		for _, it := range remaining {
-			var o r8Object
+			var o Object
 			if it.typ == 6 || it.typ == 7 {
-				var base r8Object
+				var base Object
 				var ok bool
 				if it.typ == 6 {
 					base, ok = byOff[it.base]
@@ -191,11 +174,11 @@ func r8InflatePack(raw []byte, existing map[string]r8Object) map[string]r8Object
 					next = append(next, it)
 					continue
 				}
-				o = r8Object{base.kind, r8ApplyDelta(base.data, it.data)}
+				o = Object{base.Type, r8ApplyDelta(base.Data, it.data)}
 			} else {
-				o = r8Object{map[int]string{1: "commit", 2: "tree", 3: "blob", 4: "tag"}[it.typ], it.data}
+				o = Object{types[it.typ], it.data}
 			}
-			id := r8OID(o)
+			id := oid(o)
 			out[id] = o
 			byOff[it.off] = o
 		}
@@ -205,4 +188,35 @@ func r8InflatePack(raw []byte, existing map[string]r8Object) map[string]r8Object
 		remaining = next
 	}
 	return out
+}
+
+func inflateObject(source *bytes.Reader, size int) []byte {
+	if size < 0 || size > 64<<20 {
+		panic("invalid inflated object size")
+	}
+	var stream io.ReadCloser
+	var err error
+	if saved := inflaterPool.Get(); saved != nil {
+		stream = saved.(io.ReadCloser)
+		err = stream.(zlib.Resetter).Reset(source, nil)
+	} else {
+		stream, err = zlib.NewReader(source)
+	}
+	if err != nil {
+		panic("invalid compressed object")
+	}
+	defer func() {
+		stream.Close()
+		inflaterPool.Put(stream)
+	}()
+	data := make([]byte, size)
+	if _, err := io.ReadFull(stream, data); err != nil {
+		panic("truncated inflated object")
+	}
+	var trailing [1]byte
+	n, err := io.ReadFull(stream, trailing[:])
+	if n != 0 || err != io.EOF {
+		panic("invalid object length or checksum")
+	}
+	return data
 }
