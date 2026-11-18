@@ -1,15 +1,19 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"compress/zlib"
 	"crypto/sha1"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 )
@@ -162,6 +166,9 @@ func (f *forge) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("0000"))
 		id := f.refs["refs/heads/main"]
 		caps := "multi_ack_detailed side-band-64k thin-pack ofs-delta shallow filter symref=HEAD:refs/heads/main"
+		if svc == "git-receive-pack" {
+			caps = "report-status delete-refs ofs-delta"
+		}
 		w.Write(pkt(id + " HEAD\x00" + caps + "\n"))
 		w.Write(pkt(id + " refs/heads/main\n"))
 		w.Write([]byte("0000"))
@@ -171,7 +178,317 @@ func (f *forge) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		f.upload(w, r)
 		return
 	}
-	http.Error(w, "receive-pack unavailable", 501)
+	if strings.HasSuffix(p, "git-receive-pack") {
+		w.Header().Set("content-type", "application/x-git-receive-pack-result")
+		w.Write(f.receive(r))
+		return
+	}
+}
+
+func readVarint(b []byte, i *int) int {
+	n, shift := 0, uint(0)
+	for {
+		if *i >= len(b) || shift > 56 {
+			panic("bad delta")
+		}
+		c := b[*i]
+		*i++
+		n |= int(c&127) << shift
+		if c&128 == 0 {
+			return n
+		}
+		shift += 7
+	}
+}
+func applyDelta(base, d []byte) []byte {
+	i := 0
+	if readVarint(d, &i) != len(base) {
+		panic("delta base size")
+	}
+	size := readVarint(d, &i)
+	if size > 64<<20 {
+		panic("delta size")
+	}
+	out := make([]byte, 0, size)
+	for i < len(d) {
+		c := d[i]
+		i++
+		if c&128 != 0 {
+			off, n := 0, 0
+			for j := 0; j < 4; j++ {
+				if c&(1<<j) != 0 {
+					if i >= len(d) {
+						panic("delta offset")
+					}
+					off |= int(d[i]) << (8 * j)
+					i++
+				}
+			}
+			for j := 0; j < 3; j++ {
+				if c&(1<<(4+j)) != 0 {
+					if i >= len(d) {
+						panic("delta length")
+					}
+					n |= int(d[i]) << (8 * j)
+					i++
+				}
+			}
+			if n == 0 {
+				n = 65536
+			}
+			if off+n > len(base) {
+				panic("delta bounds")
+			}
+			out = append(out, base[off:off+n]...)
+		} else {
+			n := int(c)
+			if n == 0 || i+n > len(d) {
+				panic("delta insert")
+			}
+			out = append(out, d[i:i+n]...)
+			i += n
+		}
+		if len(out) > size {
+			panic("delta overflow")
+		}
+	}
+	if len(out) != size {
+		panic("delta size mismatch")
+	}
+	return out
+}
+func inflatePack(raw []byte, existing map[string]object) map[string]object {
+	if len(raw) < 32 || string(raw[:4]) != "PACK" {
+		panic("missing pack")
+	}
+	version := binary.BigEndian.Uint32(raw[4:8])
+	if version != 2 && version != 3 {
+		panic("pack version")
+	}
+	count := binary.BigEndian.Uint32(raw[8:12])
+	if count > 100000 {
+		panic("pack count")
+	}
+	type item struct {
+		off, typ, base int
+		baseID         string
+		data           []byte
+	}
+	items := []item{}
+	pos := 12
+	for k := uint32(0); k < count; k++ {
+		off := pos
+		if pos >= len(raw)-20 {
+			panic("pack eof")
+		}
+		c := raw[pos]
+		pos++
+		typ := int(c >> 4 & 7)
+		size := int(c & 15)
+		shift := uint(4)
+		for c&128 != 0 {
+			if pos >= len(raw)-20 || shift > 56 {
+				panic("pack size")
+			}
+			c = raw[pos]
+			pos++
+			size |= int(c&127) << shift
+			shift += 7
+		}
+		it := item{off: off, typ: typ}
+		if typ == 6 {
+			c = raw[pos]
+			pos++
+			dist := int(c & 127)
+			for c&128 != 0 {
+				c = raw[pos]
+				pos++
+				dist = ((dist + 1) << 7) | int(c&127)
+			}
+			it.base = off - dist
+		} else if typ == 7 {
+			if pos+20 > len(raw)-20 {
+				panic("ref delta")
+			}
+			it.baseID = hex.EncodeToString(raw[pos : pos+20])
+			pos += 20
+		} else if map[int]string{1: "commit", 2: "tree", 3: "blob", 4: "tag"}[typ] == "" {
+			panic("object type")
+		}
+		z, e := zlib.NewReader(bytes.NewReader(raw[pos:]))
+		if e != nil {
+			panic("zlib")
+		}
+		data, e := io.ReadAll(io.LimitReader(z, 64<<20+1))
+		z.Close()
+		if e != nil || len(data) != size {
+			panic("object size")
+		}
+		pos += zlibLength(raw[pos:])
+		it.data = data
+		items = append(items, it)
+	}
+	sum := sha1.Sum(raw[:pos])
+	if pos+20 != len(raw) || !bytes.Equal(raw[pos:], sum[:]) {
+		panic("pack checksum")
+	}
+	out := map[string]object{}
+	byOff := map[int]object{}
+	remaining := items
+	for len(remaining) > 0 {
+		next := []item{}
+		for _, it := range remaining {
+			var o object
+			if it.typ == 6 || it.typ == 7 {
+				var base object
+				var ok bool
+				if it.typ == 6 {
+					base, ok = byOff[it.base]
+				} else {
+					base, ok = out[it.baseID]
+					if !ok {
+						base, ok = existing[it.baseID]
+					}
+				}
+				if !ok {
+					next = append(next, it)
+					continue
+				}
+				o = object{base.kind, applyDelta(base.data, it.data)}
+			} else {
+				o = object{map[int]string{1: "commit", 2: "tree", 3: "blob", 4: "tag"}[it.typ], it.data}
+			}
+			id := oid(o)
+			out[id] = o
+			byOff[it.off] = o
+		}
+		if len(next) == len(remaining) {
+			panic("unresolved delta")
+		}
+		remaining = next
+	}
+	return out
+}
+func zlibLength(raw []byte) int {
+	r := bytes.NewReader(raw)
+	br := bufio.NewReader(r)
+	z, e := zlib.NewReader(br)
+	if e != nil {
+		panic("zlib")
+	}
+	if _, e = io.Copy(io.Discard, z); e != nil {
+		panic("zlib data")
+	}
+	z.Close()
+	return len(raw) - r.Len() - br.Buffered()
+}
+func (f *forge) receive(r *http.Request) []byte {
+	defer func() {}()
+	data, _ := io.ReadAll(io.LimitReader(r.Body, 64<<20))
+	lines, at := []string{}, 0
+	for at+4 <= len(data) {
+		n, e := strconv.ParseUint(string(data[at:at+4]), 16, 16)
+		if e != nil {
+			break
+		}
+		at += 4
+		if n == 0 {
+			break
+		}
+		if n < 4 || at+int(n)-4 > len(data) {
+			break
+		}
+		lines = append(lines, string(data[at:at+int(n)-4]))
+		at += int(n) - 4
+	}
+	if len(lines) == 0 {
+		return []byte("0000")
+	}
+	staged := map[string]object{}
+	unpack := "ok"
+	if at < len(data) {
+		func() {
+			defer func() {
+				if recover() != nil {
+					unpack = "invalid pack"
+				}
+			}()
+			staged = inflatePack(data[at:], f.objects)
+		}()
+	}
+	type command struct{ old, next, ref, err string }
+	cmds := []command{}
+	for _, l := range lines {
+		fields := strings.Fields(strings.SplitN(l, "\x00", 2)[0])
+		if len(fields) != 3 {
+			continue
+		}
+		cmds = append(cmds, command{fields[0], fields[1], fields[2], ""})
+	}
+	objects := make(map[string]object, len(f.objects)+len(staged))
+	for k, v := range f.objects {
+		objects[k] = v
+	}
+	for k, v := range staged {
+		objects[k] = v
+	}
+	for i := range cmds {
+		c := &cmds[i]
+		cur := f.refs[c.ref]
+		if cur == "" {
+			cur = strings.Repeat("0", 40)
+		}
+		switch {
+		case unpack != "ok":
+			c.err = "unpacker error"
+		case cur != c.old:
+			c.err = "stale old object id"
+		case c.next != strings.Repeat("0", 40):
+			if _, ok := objects[c.next]; !ok {
+				c.err = "missing object"
+			} else if strings.HasPrefix(c.ref, "refs/heads/") && objects[c.next].kind != "commit" {
+				c.err = "branch target must be commit"
+			}
+		}
+	}
+	for _, c := range cmds {
+		if c.err == "" {
+			if c.next == strings.Repeat("0", 40) {
+				delete(f.refs, c.ref)
+			} else {
+				f.refs[c.ref] = c.next
+			}
+		}
+	}
+	if unpack == "ok" {
+		for k, v := range staged {
+			f.objects[k] = v
+		}
+	}
+	var out bytes.Buffer
+	out.Write(pkt("unpack " + unpack + "\n"))
+	for _, c := range cmds {
+		if c.err != "" {
+			out.Write(pkt("ng " + c.ref + " " + c.err + "\n"))
+		} else {
+			out.Write(pkt("ok " + c.ref + "\n"))
+		}
+	}
+	out.WriteString("0000")
+	if strings.Contains(strings.SplitN(lines[0], "\x00", 2)[1], "side-band-64k") {
+		var band bytes.Buffer
+		for payload := out.Bytes(); len(payload) > 0; {
+			n := len(payload)
+			if n > 65500 {
+				n = 65500
+			}
+			band.Write(pkt(string(append([]byte{1}, payload[:n]...))))
+			payload = payload[n:]
+		}
+		band.WriteString("0000")
+		return band.Bytes()
+	}
+	return out.Bytes()
 }
 func (f *forge) upload(w http.ResponseWriter, r *http.Request) {
 	raw := new(bytes.Buffer)
