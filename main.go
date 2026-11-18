@@ -10,12 +10,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 type object struct {
@@ -582,7 +584,41 @@ func main() {
 	f := seed()
 	p := os.Getenv("PORT")
 	if p == "" {
-		p = "8080"
+		p = "0"
 	}
-	http.ListenAndServe(":"+p, f)
+	ln, err := net.Listen("tcp", ":"+p)
+	if err != nil {
+		panic(err)
+	}
+	srv := &http.Server{Handler: f, ReadHeaderTimeout: 10 * time.Second}
+	go srv.Serve(ln)
+	env := strings.TrimRight(os.Getenv("MAKEFUN_ENV_URL"), "/")
+	if env == "" {
+		select {}
+	}
+	client := &http.Client{Timeout: 30 * time.Second}
+	data, _ := json.Marshal(map[string]int{"port": ln.Addr().(*net.TCPAddr).Port})
+	for {
+		resp, e := client.Post(env+"/register", "application/json", bytes.NewReader(data))
+		if e == nil {
+			resp.Body.Close()
+			if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusConflict {
+				break
+			}
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	for {
+		resp, e := client.Get(env + "/done")
+		if e == nil {
+			var state map[string]bool
+			json.NewDecoder(resp.Body).Decode(&state)
+			resp.Body.Close()
+			if state["done"] {
+				break
+			}
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	srv.Close()
 }
