@@ -106,7 +106,7 @@ func (f *forge) closure(root string, depth int) ([]string, []string) {
 				}
 			}
 			if tree != "" {
-				seen[tree] = true
+				q = append(q, item{tree, x.d})
 			}
 			if x.d >= depth && len(parents) > 0 {
 				boundary = append(boundary, x.id)
@@ -114,6 +114,17 @@ func (f *forge) closure(root string, depth int) ([]string, []string) {
 				for _, p := range parents {
 					q = append(q, item{p, x.d + 1})
 				}
+			}
+		} else if o.kind == "tree" {
+			for i := 0; i < len(o.data); {
+				z := bytes.IndexByte(o.data[i:], 0)
+				if z < 0 || i+z+21 > len(o.data) {
+					break
+				}
+				off := i + z + 1
+				id := hex.EncodeToString(o.data[off : off+20])
+				q = append(q, item{id, x.d})
+				i = off + 20
 			}
 		}
 	}
@@ -200,6 +211,14 @@ func (f *forge) upload(w http.ResponseWriter, r *http.Request) {
 		if strings.HasPrefix(l, "deepen ") {
 			fmt.Sscanf(l, "deepen %d", &depth)
 		}
+	}
+	if v2 && strings.Contains(string(data), "command=ls-refs") {
+		out.Write(pkt(f.refs["refs/heads/main"] + " HEAD symref-target:refs/heads/main\n"))
+		out.Write(pkt(f.refs["refs/heads/main"] + " refs/heads/main\n"))
+		out.WriteString("0000")
+		w.Header().Set("content-type", "application/x-git-upload-pack-result")
+		w.Write(out.Bytes())
+		return
 	}
 	if v2 && len(wants) == 0 {
 		out.WriteString("0000")
