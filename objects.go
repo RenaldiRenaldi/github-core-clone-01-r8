@@ -55,7 +55,12 @@ func links(o Object) []string {
 		t, p := info(o)
 		return append([]string{t}, p...)
 	case "tag":
-		return []string{strings.Fields(string(o.Data))[1]}
+		header, _, _ := strings.Cut(string(o.Data), "\n")
+		target, ok := strings.CutPrefix(header, "object ")
+		if !ok || !isSHA(target) {
+			fail(400, "Invalid tag target")
+		}
+		return []string{target}
 	case "tree":
 		var ids []string
 		b := o.Data

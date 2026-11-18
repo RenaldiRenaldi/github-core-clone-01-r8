@@ -5,7 +5,7 @@ const executable = fileURLToPath(new URL("forge", import.meta.url));
 const server = spawn(executable, { stdio: "inherit" });
 
 function forward(signal: NodeJS.Signals) {
-  if (server.exitCode === null && server.signalCode === null) {
+  if (!server.killed && server.exitCode === null && server.signalCode === null) {
     server.kill(signal);
   }
 }

@@ -12,9 +12,15 @@ func pkt(s string) []byte { return []byte(fmt.Sprintf("%04x%s", len(s)+4, s)) }
 // transport and object maps remain shared with REST and GraphQL.
 func serveGitAdapter(w http.ResponseWriter, r *http.Request, repo *Repo) {
 	prefix := "/" + repo.Owner + "/" + repo.Name + ".git/"
-	if !strings.HasPrefix(r.URL.Path, prefix) {
+	suffix, matched := strings.CutPrefix(r.URL.Path, prefix)
+	if !matched {
 		http.NotFound(w, r)
 		return
 	}
-	gitHTTP(w, r, repo, strings.Split(strings.TrimPrefix(r.URL.Path, prefix), "/"))
+	switch suffix {
+	case "info/refs", "git-upload-pack", "git-receive-pack":
+		gitHTTP(w, r, repo, strings.Split(suffix, "/"))
+	default:
+		http.NotFound(w, r)
+	}
 }

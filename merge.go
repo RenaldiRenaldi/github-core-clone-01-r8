@@ -8,6 +8,7 @@ import (
 
 func (r *Repo) mergePlan(base, head string) (map[string]Entry, []string) {
 	common := ""
+	baseHistory := r.history(base)
 	q := []string{head}
 	seen := map[string]bool{}
 	for len(q) > 0 {
@@ -17,7 +18,7 @@ func (r *Repo) mergePlan(base, head string) (map[string]Entry, []string) {
 			continue
 		}
 		seen[id] = true
-		if r.history(base)[id] {
+		if baseHistory[id] {
 			common = id
 			break
 		}

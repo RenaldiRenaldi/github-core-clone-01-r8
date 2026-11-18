@@ -266,7 +266,7 @@ func BenchmarkHTTP(b *testing.B) {
 		})
 	}
 }
-func TestStreamingPackReader(t *testing.T) {
+func TestPackReaderWithFragmentedInput(t *testing.T) {
 	r := fixture()
 	ids := []string{}
 	for id := range r.Objects {
@@ -282,5 +282,10 @@ func TestStreamingPackReader(t *testing.T) {
 	got := parsePackReader(reader, nil)
 	if len(got) != len(ids) {
 		t.Fatal("stream lost objects")
+	}
+	for _, id := range ids {
+		if reconstructed, found := got[id]; !found || oid(reconstructed) != id {
+			t.Fatalf("reconstructed pack is missing object %s", id)
+		}
 	}
 }

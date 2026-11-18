@@ -1,1 +1,12 @@
-{"name":"go-forge-r8","version":"8.0.0","type":"module","description":"Static Go Git smart-HTTP, REST, GraphQL, and MCP server","private":true,"license":"MIT","scripts":{"start":"node main.ts","test":"go test ./..."}}
+{
+  "name": "go-forge-r8",
+  "version": "8.0.0",
+  "type": "module",
+  "description": "Git smart HTTP, REST, GraphQL, and MCP in a single Go process",
+  "private": true,
+  "license": "MIT",
+  "scripts": {
+    "start": "node main.ts",
+    "test": "go test ./..."
+  }
+}

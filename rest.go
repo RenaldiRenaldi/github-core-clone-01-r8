@@ -32,6 +32,8 @@ func (s *Store) api(w http.ResponseWriter, q *http.Request, p []string, in M) {
 		}
 		if method == "POST" {
 			r := s.create(owner, str(in, "name"))
+			r.Lock()
+			defer r.Unlock()
 			r.Description = str(in, "description")
 			r.Private = in["private"] == true
 			if in["auto_init"] == true {
@@ -60,11 +62,11 @@ func (s *Store) api(w http.ResponseWriter, q *http.Request, p []string, in M) {
 		if limit < 1 {
 			limit = 30
 		}
-		start := (page - 1) * limit
-		if start > len(items) {
-			start = len(items)
+		start := len(items)
+		if page-1 <= len(items)/limit {
+			start = min(len(items), (page-1)*limit)
 		}
-		end := start + limit
+		end := start + min(limit, len(items)-start)
 		if end < len(items) {
 			w.Header().Set("Link", fmt.Sprintf("<%s?page=%d&per_page=%d>; rel=\"next\"", "http://"+q.Host+q.URL.Path, page+1, limit))
 		} else {
@@ -118,11 +120,6 @@ func (s *Store) api(w http.ResponseWriter, q *http.Request, p []string, in M) {
 			}
 			r.touch()
 			j(w, r.json())
-		case "DELETE":
-			s.Lock()
-			delete(s.Repos, p[1]+"/"+p[2])
-			s.Unlock()
-			answer(w, 204, nil)
 		default:
 			fail(405, "Method not allowed")
 		}
