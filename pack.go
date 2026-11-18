@@ -1,14 +1,10 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"compress/zlib"
 	"crypto/sha1"
 	"encoding/binary"
-	"encoding/hex"
-	"fmt"
-	"hash"
 	"io"
 	"sync"
 )
@@ -125,181 +121,34 @@ func delta(base, d []byte) []byte {
 	return out
 }
 
-// bufio.Reader implements io.ByteReader, preventing zlib from consuming the next object.
-type packStream struct {
-	r *bufio.Reader
-	h hash.Hash
-	n int
-}
-
-func (s *packStream) Read(p []byte) (int, error) {
-	n, e := s.r.Read(p)
-	s.n += n
-	s.h.Write(p[:n])
-	return n, e
-}
-func (s *packStream) ReadByte() (byte, error) {
-	b, e := s.r.ReadByte()
-	if e == nil {
-		s.n++
-		s.h.Write([]byte{b})
-	}
-	return b, e
-}
 func parsePack(raw []byte, existing map[string]Object) map[string]Object {
 	return parsePackReader(bytes.NewReader(raw), existing)
 }
 
-// Only inflated objects are retained: compressed input is consumed directly from io.Reader.
-func parsePackReader(input io.Reader, existing map[string]Object) map[string]Object {
-	br := &packStream{r: bufio.NewReader(input), h: sha1.New()}
-	header := make([]byte, 12)
-	if _, e := io.ReadFull(br, header); e != nil || string(header[:4]) != "PACK" {
-		fail(400, "Invalid pack")
-	}
-	version := binary.BigEndian.Uint32(header[4:8])
-	if version != 2 && version != 3 {
-		fail(400, "Pack version")
-	}
-	count := int(binary.BigEndian.Uint32(header[8:12]))
-	if count > 1000000 {
-		fail(400, "Pack count")
-	}
-	offset := func() int { return br.n }
-	type pending struct {
-		off, typ, baseOff int
-		baseID            string
-		data              []byte
-	}
-	items := []pending{}
-	for k := 0; k < count; k++ {
-		off := offset()
-		c, e := br.ReadByte()
-		if e != nil {
-			fail(400, "Pack EOF")
-		}
-		typ := int(c >> 4 & 7)
-		size := int(c & 15)
-		shift := uint(4)
-		for c&128 != 0 {
-			c, e = br.ReadByte()
-			if e != nil || shift > 60 {
-				fail(400, "Pack size")
-			}
-			size |= int(c&127) << shift
-			shift += 7
-		}
-		p := pending{off: off, typ: typ}
-		if typ == 6 {
-			c, e = br.ReadByte()
-			if e != nil {
-				fail(400, "Delta offset")
-			}
-			dist := int(c & 127)
-			for c&128 != 0 {
-				c, e = br.ReadByte()
-				if e != nil {
-					fail(400, "Delta offset")
-				}
-				dist = ((dist + 1) << 7) | int(c&127)
-			}
-			p.baseOff = off - dist
-		} else if typ == 7 {
-			id := make([]byte, 20)
-			if _, e = io.ReadFull(br, id); e != nil {
-				fail(400, "Delta id")
-			}
-			p.baseID = hex.EncodeToString(id)
-		} else if types[typ] == "" {
-			fail(400, "Pack object type")
-		}
-		if size > 64<<20 {
-			fail(400, "Object too large")
-		}
-		z, e := zlib.NewReader(br)
-		if e != nil {
-			fail(400, e.Error())
-		}
-		p.data, e = io.ReadAll(io.LimitReader(z, 64<<20+1))
-		z.Close()
-		if e != nil || len(p.data) != size {
-			fail(400, "Inflated size mismatch")
-		}
-		items = append(items, p)
-	}
-	checksum := make([]byte, 20)
-	if _, e := io.ReadFull(br.r, checksum); e != nil || !bytes.Equal(checksum, br.h.Sum(nil)) {
-		fail(400, "Pack checksum")
-	}
-	if _, e := br.r.Peek(1); e != io.EOF {
-		fail(400, "Trailing pack data")
-	}
-	out := map[string]Object{}
-	byOff := map[int]Object{}
-	remaining := items
-	for len(remaining) > 0 {
-		next := []pending{}
-		for _, p := range remaining {
-			var o Object
-			if p.typ == 6 || p.typ == 7 {
-				base, ok := byOff[p.baseOff]
-				if p.typ == 7 {
-					base, ok = out[p.baseID]
-					if !ok {
-						base, ok = existing[p.baseID]
-					}
-				}
-				if !ok {
-					next = append(next, p)
-					continue
-				}
-				o = Object{base.Type, delta(base.Data, p.data)}
-			} else {
-				o = Object{types[p.typ], p.data}
-			}
-			out[oid(o)] = o
-			byOff[p.off] = o
-		}
-		if len(next) == len(remaining) {
-			fail(400, "Unresolved delta")
-		}
-		remaining = next
-	}
-	return out
-}
-func pkt(s string) []byte { return append([]byte(fmt.Sprintf("%04x", len(s)+4)), []byte(s)...) }
-func packets(raw []byte) ([]string, int) {
-	var out []string
-	i := 0
-	for i+4 <= len(raw) {
-		var n int
-		if _, e := fmt.Sscanf(string(raw[i:i+4]), "%04x", &n); e != nil {
-			break
-		}
-		i += 4
-		if n == 0 {
-			return out, i
-		}
-		if n < 4 {
-			continue
-		}
-		if i+n-4 > len(raw) {
-			fail(400, "Truncated pkt-line")
-		}
-		out = append(out, string(raw[i:i+n-4]))
-		i += n - 4
-	}
-	return out, i
-}
 func sideband(raw []byte) []byte {
-	var b bytes.Buffer
-	for len(raw) > 0 {
-		n := len(raw)
-		if n > 65500 {
-			n = 65500
-		}
-		b.Write(pkt(string(append([]byte{1}, raw[:n]...))))
+	var framed bytes.Buffer
+	for len(raw) != 0 {
+		n := min(len(raw), 65500)
+		framed.Write(pkt(string(append([]byte{1}, raw[:n]...))))
 		raw = raw[n:]
 	}
-	return b.Bytes()
+	return framed.Bytes()
+}
+
+// The R8 decoder handles regular, offset-delta, and reference-delta entries.
+func parsePackReader(input io.Reader, existing map[string]Object) map[string]Object {
+	raw, err := io.ReadAll(io.LimitReader(input, 64<<20+1))
+	if err != nil || len(raw) > 64<<20 {
+		fail(400, "Pack too large")
+	}
+	prior := make(map[string]r8Object, len(existing))
+	for id, obj := range existing {
+		prior[id] = r8Object{kind: obj.Type, data: obj.Data}
+	}
+	decoded := r8InflatePack(raw, prior)
+	out := make(map[string]Object, len(decoded))
+	for id, obj := range decoded {
+		out[id] = Object{Type: obj.kind, Data: obj.data}
+	}
+	return out
 }
