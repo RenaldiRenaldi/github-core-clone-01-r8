@@ -2,7 +2,7 @@ package main
 
 import (
 	"fmt"
-	"html/template"
+	"html"
 	"net/http"
 	"net/url"
 	"sort"
@@ -37,39 +37,49 @@ type browserPage struct {
 	Contents     string
 }
 
-var browserTemplate = template.Must(template.New("repository").Parse(`<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{{.Title}} · Go Forge</title>
-  <style>
-    body { max-width: 60rem; margin: 2rem auto; padding: 0 1rem; font: 1rem system-ui; }
-    pre { border: 1px solid currentColor; padding: 1rem; overflow-x: auto; }
-    li { margin: .4rem 0; }
-  </style>
-</head>
-<body>
-<header><a href="/">Go Forge</a></header>
-<main>
-  <h1>{{.Title}}</h1>
-  {{if .Description}}<p>{{.Description}}</p>{{end}}
-  {{if .ShowContents}}
-    <pre>{{.Contents}}</pre>
-  {{else if .Repository}}
-    <h2>Files</h2>
-    <ul>{{range .Files}}<li><a href="{{.URL}}">{{.Text}}</a></li>{{else}}<li>No files.</li>{{end}}</ul>
-    <h2>Recent commits</h2>
-    <ol>{{range .Commits}}<li><code>{{.ShortID}}</code> {{.Title}}</li>{{else}}<li>No commits.</li>{{end}}</ol>
-    <h2>Issues</h2>
-    <ul>{{range .Issues}}<li>#{{.Number}} {{.Title}} ({{.State}})</li>{{else}}<li>No issues.</li>{{end}}</ul>
-  {{else}}
-    <ul>{{range .Repositories}}<li><a href="{{.URL}}">{{.Text}}</a></li>{{else}}<li>No public repositories.</li>{{end}}</ul>
-  {{end}}
-</main>
-</body>
-</html>
-`))
+func renderBrowser(w http.ResponseWriter, page browserPage) {
+	var body strings.Builder
+	escape := html.EscapeString
+	body.WriteString(`<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">`)
+	fmt.Fprintf(&body, "<title>%s · Go Forge</title>", escape(page.Title))
+	body.WriteString(`<style>body{max-width:60rem;margin:2rem auto;padding:0 1rem;font:1rem system-ui}pre{padding:1rem;border:1px solid;overflow:auto}li{margin:.4rem 0}</style>`)
+	body.WriteString(`<header><a href="/">Go Forge</a></header><main>`)
+	fmt.Fprintf(&body, "<h1>%s</h1>", escape(page.Title))
+	if page.Description != "" {
+		fmt.Fprintf(&body, "<p>%s</p>", escape(page.Description))
+	}
+	switch {
+	case page.ShowContents:
+		fmt.Fprintf(&body, "<pre>%s</pre>", escape(page.Contents))
+	case page.Repository:
+		body.WriteString("<h2>Files</h2>")
+		renderLinks(&body, page.Files, "No files.")
+		body.WriteString("<h2>Recent commits</h2><ol>")
+		for _, commit := range page.Commits {
+			fmt.Fprintf(&body, "<li><code>%s</code> %s</li>", escape(commit.ShortID), escape(commit.Title))
+		}
+		body.WriteString("</ol><h2>Issues</h2><ul>")
+		for _, issue := range page.Issues {
+			fmt.Fprintf(&body, "<li>#%d %s (%s)</li>", issue.Number, escape(issue.Title), escape(issue.State))
+		}
+		body.WriteString("</ul>")
+	default:
+		renderLinks(&body, page.Repositories, "No public repositories.")
+	}
+	body.WriteString("</main></html>")
+	w.Write([]byte(body.String()))
+}
+
+func renderLinks(body *strings.Builder, links []browserLink, empty string) {
+	body.WriteString("<ul>")
+	if len(links) == 0 {
+		fmt.Fprintf(body, "<li>%s</li>", html.EscapeString(empty))
+	}
+	for _, link := range links {
+		fmt.Fprintf(body, "<li><a href=\"%s\">%s</a></li>", html.EscapeString(link.URL), html.EscapeString(link.Text))
+	}
+	body.WriteString("</ul>")
+}
 
 func (s *Store) ui(w http.ResponseWriter, q *http.Request, segments []string) {
 	if q.Method != http.MethodGet && q.Method != http.MethodHead {
@@ -86,9 +96,7 @@ func (s *Store) ui(w http.ResponseWriter, q *http.Request, segments []string) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'")
-	if err := browserTemplate.Execute(w, page); err != nil {
-		fmt.Printf("render browser page: %v\n", err)
-	}
+	renderBrowser(w, page)
 }
 
 func (s *Store) publicIndex() browserPage {
